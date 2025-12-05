@@ -42,6 +42,9 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
     seq_lens_tensor: Optional[torch.Tensor]
     context_lens_tensor: Optional[torch.Tensor]
     query_start_loc: Optional[torch.Tensor] = None
+    conv_state_indices: Optional[torch.Tensor] = None
+    mamba_cache_decode_indices: Optional[torch.Tensor] = None
+    mamba_cache_prefill_indices: Optional[torch.Tensor] = None
 
     def seq_len(self):
         return self.slot_mapping.size(-1)
@@ -59,7 +62,10 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                               seq_lens_tensor,
                               slot_mapping,
                               block_size,
-                              query_start_loc=None):
+                              query_start_loc=None,
+                              conv_state_indices=None,
+                              mamba_cache_decode_indices=None,
+                              mamba_cache_prefill_indices=None):
         return cls(is_prompt=True,
                    block_list=block_list,
                    block_mapping=None,
@@ -72,7 +78,10 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                    input_positions=None,
                    slot_mapping=slot_mapping,
                    block_size=block_size,
-                   query_start_loc=query_start_loc)
+                   query_start_loc=query_start_loc,
+                   conv_state_indices=conv_state_indices,
+                   mamba_cache_decode_indices=mamba_cache_decode_indices,
+                   mamba_cache_prefill_indices=mamba_cache_prefill_indices)
 
     @classmethod
     def make_decode_metadata(cls,
@@ -85,7 +94,10 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                              window_block_list,
                              window_block_usage,
                              window_block_groups,
-                             query_start_loc=None):
+                             query_start_loc=None,
+                             conv_state_indices=None,
+                             mamba_cache_decode_indices=None,
+                             mamba_cache_prefill_indices=None):
         return cls(is_prompt=False,
                    block_mapping=None,
                    alibi_blocks=None,
@@ -101,4 +113,7 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                    input_positions=input_positions,
                    slot_mapping=slot_mapping,
                    block_size=block_size,
-                   query_start_loc=query_start_loc)
+                   query_start_loc=query_start_loc,
+                   conv_state_indices=conv_state_indices,
+                   mamba_cache_decode_indices=mamba_cache_decode_indices,
+                   mamba_cache_prefill_indices=mamba_cache_prefill_indices)

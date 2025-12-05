@@ -18,7 +18,7 @@ def launch_lm_eval(eval_config):
     trust_remote_code = eval_config.get('trust_remote_code', False)
     dtype = eval_config.get('dtype', 'bfloat16')
     max_num_seqs = eval_config.get('max_num_seqs', 128)
-    tp_size = int(os.environ.get('TP_SIZE', '1'))
+    tp_size = int(os.environ.get('TP_SIZE', '8'))
     enable_apc = os.environ.get('ENABLE_APC', 'False').lower() in ['true', '1']
     enforce_eager = os.environ.get('ENFORCE_EAGER', 'False').lower() in ['true', '1']
     kv_cache_dtype = os.environ.get('KV_CACHE_DTYPE', None)
@@ -28,7 +28,7 @@ def launch_lm_eval(eval_config):
         'pretrained': eval_config['model_name'],
         'tensor_parallel_size': tp_size,
         'async_scheduling': async_scheduling,
-        'enforce_eager': enforce_eager,
+        'enforce_eager': True,
         'enable_prefix_caching': enable_apc,
         'add_bos_token': True,
         'dtype': dtype,
@@ -36,9 +36,12 @@ def launch_lm_eval(eval_config):
         'max_num_seqs': max_num_seqs,
         'trust_remote_code': trust_remote_code,
         'batch_size': max_num_seqs,
-        'enable_expert_parallel': eval_config.get('enable_expert_parallel', False),
+        # 'enable_expert_parallel': eval_config.get('enable_expert_parallel', False),
         'chat_template_args': eval_config.get('chat_template_args', {}),
         'seed': eval_config.get('seed', 42),
+        'gpu_memory_utilization': 0.5,
+        'enable_expert_parallel': True,
+        # 'max_new_tokens': 512,
     }
     if kv_cache_dtype is not None:
         model_args['kv_cache_dtype'] = kv_cache_dtype
@@ -60,6 +63,7 @@ def launch_lm_eval(eval_config):
                                       num_fewshot=eval_config["num_fewshot"],
                                       limit=eval_config["limit"],
                                       batch_size="auto",
+                                    #   max_gen_toks=2048,
                                       **kwargs)
     del llm
     gc.collect()

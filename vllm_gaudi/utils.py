@@ -1,3 +1,4 @@
+# from collections import defaultdict
 from functools import cache
 import os
 from vllm.utils.torch_utils import make_tensor_with_pad, TORCH_DTYPE_TO_NUMPY_DTYPE

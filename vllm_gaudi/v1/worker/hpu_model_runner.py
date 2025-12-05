@@ -674,6 +674,11 @@ def trim_attn_metadata(metadata: HPUAttentionMetadataV1) -> object:
         'window_block_usage',
         'window_block_groups',
         'window_attn_bias',
+        # 'num_prefills',
+        # 'num_decodes',
+        'conv_state_indices',
+        'mamba_cache_decode_indices',
+        'mamba_cache_prefill_indices',
     ])
     return attention_metadata
 
@@ -1443,6 +1448,10 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
             return self.model.model
         assert self.model is not None
         return self.model
+    
+    # fla is short for Flat Linear Attention
+    def _is_fla_model(self):
+        return hasattr(self.model_config.hf_config, "linear_conv_kernel_dim")
 
     def is_decoder_only(self, req_id) -> bool:
         return bool(req_id in self.input_batch.req_type and \
@@ -1452,6 +1461,7 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
         self,
         scheduler_output: "SchedulerOutput",
     ) -> PromptDecodeInfo:
+        # print(f"scheduler_output: {scheduler_output}")
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
@@ -1728,10 +1738,11 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
 
         return attn_mask.unflatten(0, (1, -1))
 
-    def _form_prefill_batch(self, contents):
+    def _form_prefill_batch(self, contents) -> PrefillInputData:
         if len(contents.req_ids) == 0:
             return PrefillInputData()
 
+        # print(f"Prefill contents: {contents}")
         token_ids = contents.token_ids
         req_ids = contents.req_ids
         query_lens = [len(tids) for tids in contents.token_ids]
@@ -1752,19 +1763,28 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
         context_groups = [[i] * b for i, b in enumerate(num_context_blocks)]
         has_context = sum(context_lens) > 0
         target_bs, target_seq, target_blocks = self._get_prompt_bucketing_fn()(query_lens, num_context_blocks)
+        # print(f"Prefill bucketing: target_bs={target_bs}, target_seq={target_seq}, target_blocks={target_blocks}")
 
         target_bs += self.get_dp_padding(target_bs)
         target_seq += self.get_dp_padding(target_seq)
         target_blocks += self.get_dp_padding(target_blocks)
+        
+        # print(f"Prefill bucketing after dp padding: target_bs={target_bs}, target_seq={target_seq}, target_blocks={target_blocks}")
+        
 
         # NOTE: If model does not support multimodal inputs, we pad here.
         # For models with multimodal support, we may want to get embeddings
         # for the valid tokens before padding.
         # This would require getting multimodal input embeddings here as well
+        # print(f"Prefill lengths before padding: query_lens={query_lens}, context_lens={context_lens}")
+        # print(f"Prefill token_ids before padding: {token_ids}")
         token_ids = align_and_pad(contents.token_ids, (target_bs, target_seq), itertools.repeat(-1))
+        # print(f"Prefill token_ids after padding: {token_ids}")
         # Update query_lens and context_lens after padding
         query_lens.extend([0] * (target_bs - len(query_lens)))
         context_lens.extend([0] * (target_bs - len(context_lens)))
+        
+        # print(f"Prefill lengths after padding: query_lens={query_lens}, context_lens={context_lens}")
 
         # If the model uses M-RoPE, we need to fill
         # and pad the M-RoPE positions for the scheduled prefill tokens
@@ -1791,16 +1811,28 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
         cur_offset = 0
         logits_indices = []
         logits_requests = []
+        conv_state_indices_list = []
+        conv_state_indices = []
+        mamba_prefill_indices = []
         for req_id, qlen, log_pos in zip(req_ids, query_lens, contents.logits_positions):
             source = [cur_offset + x for x in log_pos]
             dest = [req_id] * len(log_pos)
             logits_indices.extend(source)
             logits_requests.extend(dest)
+            if self._is_fla_model():
+                kernel_dim = self.model_config.hf_config.linear_conv_kernel_dim
+                conv_state_indices_list.append(list(range(qlen - kernel_dim + 1, qlen)))  # type: ignore[assignment]
+                mamba_prefill_indices.append(int(req_id))
             if self.use_merged_prefill:
                 cur_offset += qlen
             else:
                 cur_offset += len(token_ids[0])
 
+        if self._is_fla_model():
+            conv_state_indices = conv_state_indices_list[0]
+            for idx in range(1, len(conv_state_indices_list)):
+                conv_state_indices.extend([x + idx * target_seq for x in conv_state_indices_list[idx]])
+        
         attn_bias = None
         if self.use_merged_prefill:
             attn_bias = self._make_attn_bias(context_groups, token_groups)
@@ -1819,20 +1851,27 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
         context_lens = async_h2d_copy(context_lens, dtype=torch.int32)
         context_blocks_t: Optional[torch.tensor]
         context_blocks_t = async_h2d_copy(context_blocks, dtype=torch.int32).flatten() if has_context else None
+        conv_state_indices = async_h2d_copy(conv_state_indices, dtype=torch.long)
+        # print(f"mamba_prefill_indices: {mamba_prefill_indices}")
+        mamba_prefill_indices = async_h2d_copy(mamba_prefill_indices, dtype=torch.long)
 
         attn_metadata = HPUAttentionMetadataV1.make_prefill_metadata(seq_lens_tensor=query_lens,
                                                                      context_lens_tensor=context_lens,
                                                                      slot_mapping=token_slots,
                                                                      block_list=context_blocks_t,
                                                                      attn_bias=attn_bias,
-                                                                     block_size=self.block_size)
-        return PrefillInputData(request_ids=[req_ids],
+                                                                     block_size=self.block_size,#)
+                                                                     conv_state_indices=conv_state_indices,
+                                                                     mamba_cache_prefill_indices=mamba_prefill_indices)
+        prefill_input_data: PrefillInputData = PrefillInputData(request_ids=[req_ids],
                                 prompt_lens=[query_lens],
                                 token_ids=[token_ids],
                                 position_ids=[token_positions],
                                 attn_metadata=[attn_metadata],
                                 logits_indices=[logits_indices],
                                 logits_requests=[logits_requests])
+        # print(f"prefill_input_data: {prefill_input_data}")
+        return prefill_input_data
 
     def _form_unified_prefill_batch(self, contents):
         if len(contents.req_ids) == 0:
@@ -1897,7 +1936,9 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
             self._extract_prefill_batch_contents(
                 num_prefills, num_decodes, num_scheduled_tokens)
         all_batches = [self._form_prefill_batch(bc) for bc in all_batch_contents]
+        # print(f"all_batches before merge: {all_batches}")
         merge_contents(all_batches[0], *all_batches[1:])
+        # print(f"all_batches after merge: {all_batches}")
 
         dummy_prefill_input_batches = None
         if num_pad_across_dp > 0:
@@ -2040,7 +2081,7 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
         # example:
         # num_scheduled_tokens = [2, 1, 2, 1]
         # padded tokens_id = \
-        #     [[tok_0, tok_1], [tok_2, pad], [tok_4, tok_4], [tok_6, pad]]
+        #     [[tok_0, tok_1], [tok_2, pad], [tok_4, tok_5], [tok_6, pad]]
         # num_tokens = 2
         # query_start_loc_list = [2, 3, 6, 7]
         # query_start_loc_cpu = [0, 2, 3, 6, 7]
@@ -2066,6 +2107,13 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
                 slot_mapping.tolist(),
                 padded_batch_size * num_tokens
             )
+        
+        # mamba_cached_decode_indices
+        mamba_cache_decode_indices = []
+        if self._is_fla_model():
+            for idx in block_list[:num_decodes]:
+                mamba_cache_decode_indices.append(idx - 1)
+        # print(f"mamba_cache_decode_indices: {mamba_cache_decode_indices}")
 
         if self.interleaved_sliding_window and self.sliding_window > 0:
             sliding_block_size = (self.sliding_window // self.block_size)
@@ -2086,6 +2134,8 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
                                                    device=self.device) if self.interleaved_sliding_window else None
         window_block_groups_device = async_h2d_copy(window_block_groups,
                                                     device=self.device) if self.interleaved_sliding_window else None
+        mamba_cache_decode_indices = async_h2d_copy(mamba_cache_decode_indices, device=self.device, dtype=torch.long)
+
 
         token_ids_device = async_h2d_copy(token_ids, device=self.device)
         # when DP also enabled, some DP ranks will exeucte dummy run with empty
@@ -2109,6 +2159,7 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
                 token_ids_device = token_ids_device.view(-1, 1)
 
         # call prepare_spec_decode_inputs to get the logits indices and
+        # 先不管，因为一直是None
         if scheduler_output is not None:
             logits_indices, spec_decode_metadata = self._prepare_spec_decode_inputs(scheduler_output, logits_indices,
                                                                                     token_ids_device, num_tokens)
@@ -2116,7 +2167,8 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
             spec_decode_metadata = None
         logits_indices_device = async_h2d_copy(logits_indices, device=self.device)
 
-        return DecodeInputData(num_decodes=num_decodes,
+        decode_input_data: DecodeInputData = \
+            DecodeInputData(num_decodes=num_decodes,
                                token_ids=token_ids_device,
                                position_ids=positions_device,
                                logits_indices=logits_indices_device,
@@ -2130,8 +2182,11 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
                                    window_block_list=window_block_list_device,
                                    window_block_usage=window_block_usage_device,
                                    window_block_groups=window_block_groups_device,
+                                   mamba_cache_decode_indices=mamba_cache_decode_indices,
                                ),
                                spec_decode_metadata=spec_decode_metadata)
+        # print(f"decode_input_data: {decode_input_data}")
+        return decode_input_data
 
     def _prepare_decode_inputs(self,
                                num_decodes,
@@ -2463,7 +2518,9 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
         else:
             # no hpu graphs for t.compile?
             use_graphs = False
+        # print(f"attn_metadata: {attn_metadata}")
         trimmed_attn_metadata = attn_metadata if self.unified_attn else trim_attn_metadata(attn_metadata)
+        # print(f"trimmed_attn_metadata: {trimmed_attn_metadata}")
         if self.is_driver_worker:
             model_event_name = ("model_forward_"
                                 f"bs{batch_size}_"
@@ -3076,6 +3133,9 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
                         prefill_start_idx = num_decodes
                         invalid_req_indices.append(prefill_start_idx + idx)
                 htorch.core.mark_step()
+                # print(f"token_ids in generic: {token_ids} {token_ids.shape}")
+                # print(f"position_ids in generic: {position_ids} {position_ids.shape}")
+                # print(f"logits_indices in generic: {logits_indices} {logits_indices.shape}")
                 non_flattened_hidden_states, aux_hidden_states, \
                     sample_hidden_states, logits_device = \
                     self._execute_model_generic(
@@ -3150,6 +3210,9 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
             self.event_start = self.profiler.get_timestamp_us()
             self.profiler.start("internal", "decode")
             htorch.core.mark_step()
+            # print(f"decode_data.token_ids in generic: {decode_data.token_ids} {decode_data.token_ids.shape}")
+            # print(f"decode_data.position_ids in generic: {decode_data.position_ids} {decode_data.position_ids.shape}")
+            # print(f"decode_data.logits_indices in generic: {decode_data.logits_indices} {decode_data.logits_indices.shape}")
             non_flattened_hidden_states, aux_hidden_states, \
                 sample_hidden_states, logits_device = \
                     self._execute_model_generic(
